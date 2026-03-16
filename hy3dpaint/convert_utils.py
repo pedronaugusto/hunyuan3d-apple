@@ -1,3 +1,5 @@
+import os
+import tempfile
 import trimesh
 import pygltflib
 import numpy as np
@@ -55,11 +57,13 @@ def create_glb_with_pbr_materials(obj_path, textures_dict, output_path):
     mesh = trimesh.load(obj_path)
 
     # 2. 先导出为临时GLB
-    temp_glb = "temp.glb"
+    temp_fd, temp_glb = tempfile.mkstemp(suffix=".glb")
+    os.close(temp_fd)
     mesh.export(temp_glb)
 
     # 3. 加载GLB文件进行材质编辑
     gltf = pygltflib.GLTF2().load(temp_glb)
+    os.unlink(temp_glb)
 
     # 4. 准备纹理数据
     def image_to_data_uri(image_path):
@@ -71,7 +75,8 @@ def create_glb_with_pbr_materials(obj_path, textures_dict, output_path):
 
     # 5. 合并metallic和roughness
     if "metallic" in textures_dict and "roughness" in textures_dict:
-        mr_combined_path = "mr_combined.png"
+        temp_fd, mr_combined_path = tempfile.mkstemp(suffix=".png")
+        os.close(temp_fd)
         combine_metallic_roughness(textures_dict["metallic"], textures_dict["roughness"], mr_combined_path)
         textures_dict["metallicRoughness"] = mr_combined_path
 
@@ -135,6 +140,11 @@ def create_glb_with_pbr_materials(obj_path, textures_dict, output_path):
 
     # 9. 保存最终GLB
     gltf.save(output_path)
-    print(f"PBR GLB文件已保存: {output_path}")
+
+    # Clean up temp files
+    if "metallicRoughness" in textures_dict and os.path.exists(textures_dict["metallicRoughness"]):
+        os.unlink(textures_dict["metallicRoughness"])
+
+    print(f"PBR GLB saved: {output_path}")
 
 

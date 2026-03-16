@@ -143,7 +143,12 @@ class HunyuanPaint(pl.LightningModule):
         self.register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1).float())
 
     def on_fit_start(self):
-        device = torch.device(f"cuda:{self.local_rank}")
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{self.local_rank}")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
         self.pipeline.to(device)
         if self.global_rank == 0:
             os.makedirs(os.path.join(self.logdir, "images_val"), exist_ok=True)

@@ -1,0 +1,77 @@
+# Hunyuan3D-2.1 macOS (Apple Silicon) — MLX backend & API
+#
+# Usage:
+#   pyenv local 3.11
+#   python -m pip install -U pip setuptools wheel
+#   python -m pip install -r requirements_macos.txt
+#
+# Notes:
+# - Excludes CUDA-only packages (cupy, deepspeed)
+# - PyTorch is needed for the texture pipeline (MPS)
+
+# MLX
+mlx>=0.31
+
+# PyTorch (install from pytorch.org nightly/stable for MPS)
+torch>=2.7
+torchvision>=0.22
+torchaudio>=2.7
+
+# Blender Python API
+bpy>=5.0
+
+# HF / diffusion stack
+transformers>=4.46.0
+diffusers>=0.30.0
+accelerate>=1.1.1
+huggingface-hub>=0.30.2
+safetensors>=0.4.4
+timm>=1.0
+
+# Build tools
+ninja
+pybind11
+
+# Scientific computing
+numpy
+scipy
+einops
+pandas
+
+# Computer vision & image processing
+opencv-python
+imageio
+scikit-image
+Pillow>=10
+rembg
+realesrgan
+basicsr
+
+# 3D mesh processing
+fast_simplification
+trimesh
+pymeshlab
+pygltflib
+xatlas
+open3d
+
+# Configuration
+omegaconf
+pyyaml
+configargparse
+
+# Web / API
+fastapi
+uvicorn
+python-multipart
+gradio
+requests
+httpx
+
+# Utilities
+tqdm
+psutil
+pydantic
+torchmetrics
+torchdiffeq
+onnxruntime

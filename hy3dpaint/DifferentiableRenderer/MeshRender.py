@@ -334,14 +334,14 @@ class MeshRender:
         raster_mode="cr",
         shader_type="face",
         use_opengl=False,
-        device="cuda",
+        device=None,
     ):
         """
         Initialize mesh renderer with configurable parameters.
-        
+
         Args:
             camera_distance: Distance from camera to object center
-            camera_type: Type of camera projection ("orth" or "perspective") 
+            camera_type: Type of camera projection ("orth" or "perspective")
             default_resolution: Default rendering resolution
             texture_size: Size of texture maps
             use_antialias: Whether to use antialiasing
@@ -351,9 +351,16 @@ class MeshRender:
             raster_mode: Rasterization backend ("cr" for custom rasterizer)
             shader_type: Shading type ("face" or "vertex")
             use_opengl: Whether to use OpenGL backend (deprecated)
-            device: Computing device ("cuda" or "cpu")
+            device: Computing device ("cuda", "mps", or "cpu")
         """
 
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
         self.device = device
 
         self.set_default_render_resolution(default_resolution)
@@ -537,6 +544,8 @@ class MeshRender:
             findices, barycentric = self.raster.rasterize(pos, tri, resolution)
             rast_out = torch.cat((barycentric, findices.unsqueeze(-1)), dim=-1)
             rast_out = rast_out.unsqueeze(0)
+            # Move rasterizer output to match mesh device (CPU rasterizer + MPS tensors)
+            rast_out = rast_out.to(self.device)
         else:
             raise f"No raster named {self.raster_mode}"
 

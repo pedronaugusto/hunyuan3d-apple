@@ -686,8 +686,8 @@ class SelfAttnProcessor2_0(BaseAttnProcessor):
         token_suffix = "" if token == "albedo" else "_" + token
 
         # Device management (if needed)
-        if multiple_devices:
-            device = torch.device("cuda:0") if token == "albedo" else torch.device("cuda:1")
+        if multiple_devices and torch.cuda.is_available():
+            device = hidden_states.device
             for attr in [f"to_q{token_suffix}", f"to_k{token_suffix}", f"to_v{token_suffix}", f"to_out{token_suffix}"]:
                 getattr(target, attr).to(device)
 
@@ -747,7 +747,7 @@ class SelfAttnProcessor2_0(BaseAttnProcessor):
         # Process each PBR setting
         results = []
         for token, pbr_hs in zip(self.pbr_setting, pbr_hidden_states):
-            processed_hs = rearrange(pbr_hs, "b n_pbrs n l c -> (b n_pbrs n) l c").to("cuda:0")
+            processed_hs = rearrange(pbr_hs, "b n_pbrs n l c -> (b n_pbrs n) l c").to(hidden_states.device)
             result = self.process_single(attn, processed_hs, None, attention_mask, temb, token, False)
             results.append(result)
 
@@ -805,31 +805,53 @@ class RefAttnProcessor2_0(BaseAttnProcessor):
         """
         AttnUtils.handle_deprecation_warning(args, kwargs)
 
-        def get_qkv(attn, hidden_states, encoder_hidden_states, **kwargs):
-            query = attn.to_q(hidden_states)
-            key = attn.to_k(encoder_hidden_states)
+        # MPS workaround: MPS scaled_dot_product_attention silently truncates
+        # the value dim to match the key dim.  The original CUDA path
+        # concatenates all PBR value projections into one V tensor and runs a
+        # single SDPA call, then splits the output.  On MPS this drops every
+        # material after albedo.  Fix: run one SDPA per material with
+        # shared Q/K and separate V, matching CUDA numerics exactly.
+        #
+        # Prepare hidden states (shared preprocessing)
+        hidden_states_in, residual, input_ndim, shape_info = AttnUtils.prepare_hidden_states(hidden_states, attn, temb)
 
-            # Concatenate values from all PBR settings
-            value_list = [attn.to_v(encoder_hidden_states)]
-            for token in ["_" + token for token in self.pbr_settings if token != "albedo"]:
-                value_list.append(getattr(attn.processor, f"to_v{token}")(encoder_hidden_states))
-            value = torch.cat(value_list, dim=-1)
-
-            return query, key, value
-
-        # Core processing
-        hidden_states, residual, input_ndim, shape_info, batch_size, heads, head_dim = AttnCore.process_attention_base(
-            attn, hidden_states, encoder_hidden_states, attention_mask, temb, get_qkv_fn=get_qkv
+        batch_size, sequence_length, _ = (
+            hidden_states_in.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
 
-        # Split and process each PBR setting output
-        hidden_states_list = torch.split(hidden_states, head_dim, dim=-1)
-        output_hidden_states_list = []
+        attention_mask_prep = AttnUtils.prepare_attention_mask(attention_mask, attn, sequence_length, batch_size)
 
-        for i, hs in enumerate(hidden_states_list):
-            hs = hs.transpose(1, 2).reshape(batch_size, -1, heads * head_dim).to(hs.dtype)
-            token_suffix = "_" + self.pbr_settings[i] if self.pbr_settings[i] != "albedo" else ""
-            target = attn if self.pbr_settings[i] == "albedo" else attn.processor
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states_in
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        # Shared Q and K
+        query = attn.to_q(hidden_states_in)
+        key = attn.to_k(encoder_hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = AttnUtils.reshape_qkv_for_attention(query, batch_size, attn.heads, head_dim)
+        key = AttnUtils.reshape_qkv_for_attention(key, batch_size, attn.heads, head_dim)
+
+        query, key = AttnUtils.apply_norms(query, key, getattr(attn, "norm_q", None), getattr(attn, "norm_k", None))
+
+        # Per-material V + SDPA + output projection
+        output_hidden_states_list = []
+        for i, token in enumerate(self.pbr_settings):
+            token_suffix = "_" + token if token != "albedo" else ""
+            target = attn if token == "albedo" else attn.processor
+
+            v_proj = attn.to_v if token == "albedo" else getattr(attn.processor, f"to_v_{token}")
+            value = v_proj(encoder_hidden_states)
+            value = AttnUtils.reshape_qkv_for_attention(value, batch_size, attn.heads, head_dim)
+
+            hs = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask_prep, dropout_p=0.0, is_causal=False
+            )
+            hs = hs.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim).to(hs.dtype)
 
             hs = AttnUtils.finalize_output(
                 hs, input_ndim, shape_info, attn, residual, getattr(target, f"to_out{token_suffix}")

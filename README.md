@@ -22,6 +22,10 @@
 [//]: # (  <a href="#"><img alt="PyPI - Downloads" src="https://img.shields.io/pypi/v/mulankit?logo=pypi"  height=22px></a>)
 <br>
 
+## 🍎 Apple Silicon Fork
+
+This fork adds an **MLX backend** for native Apple Silicon (M-series) inference. The original CUDA pipeline is fully preserved. See `mlx_backend/` for details and `requirements_macos.txt` for macOS dependencies.
+
 ## 🔥 News
 
 - Jul 26, 2025: 🤗 We release the first open-source, simulation-capable, immersive 3D world generation model, [HunyuanWorld-1.0](https://github.com/Tencent-Hunyuan/HunyuanWorld-1.0)!

@@ -12,7 +12,7 @@ void rasterizeTriangleCPU(int idx, float* vt0, float* vt1, float* vt2, int width
         for (int py = y_min; py < y_max + 1; ++py) {
             if (py < 0 || py >= height)
                 continue;
-            float vt[2] = {px + 0.5, py + 0.5};
+            float vt[2] = {px + 0.5f, py + 0.5f};
             float baryCentricCoordinate[3];
             calculateBarycentricCoordinate(vt0, vt1, vt2, vt, baryCentricCoordinate);
             if (isBarycentricCoordInBounds(baryCentricCoordinate)) {
@@ -105,19 +105,19 @@ std::vector<torch::Tensor> rasterize_image_cpu(torch::Tensor V, torch::Tensor F,
     if (!use_depth_prior) {
         for (int i = 0; i < num_faces; ++i) {
             rasterizeImagecoordsKernelCPU(V.data_ptr<float>(), F.data_ptr<int>(), 0,
-                (INT64*)z_min.data_ptr<long>(), occlusion_truncation, width, height, num_vertices, num_faces, i); 
+                (INT64*)z_min.data_ptr<int64_t>(), occlusion_truncation, width, height, num_vertices, num_faces, i); 
         }
     } else {
         for (int i = 0; i < num_faces; ++i)
             rasterizeImagecoordsKernelCPU(V.data_ptr<float>(), F.data_ptr<int>(), D.data_ptr<float>(),
-                (INT64*)z_min.data_ptr<long>(), occlusion_truncation, width, height, num_vertices, num_faces, i);
+                (INT64*)z_min.data_ptr<int64_t>(), occlusion_truncation, width, height, num_vertices, num_faces, i);
     }
 
     auto float_options = torch::TensorOptions().dtype(torch::kFloat32).requires_grad(false);
     auto barycentric = torch::zeros({height, width, 3}, float_options);
     for (int i = 0; i < width * height; ++i)
         barycentricFromImgcoordCPU(V.data_ptr<float>(), F.data_ptr<int>(),
-            findices.data_ptr<int>(), (INT64*)z_min.data_ptr<long>(), width, height, num_vertices, num_faces, barycentric.data_ptr<float>(), i);
+            findices.data_ptr<int>(), (INT64*)z_min.data_ptr<int64_t>(), width, height, num_vertices, num_faces, barycentric.data_ptr<float>(), i);
 
     return {findices, barycentric};
 }
@@ -128,8 +128,18 @@ std::vector<torch::Tensor> rasterize_image(torch::Tensor V, torch::Tensor F, tor
     int device_id = V.get_device();
     if (device_id == -1)
         return rasterize_image_cpu(V, F, D, width, height, occlusion_truncation, use_depth_prior);
+#ifdef __CUDACC__
     else
         return rasterize_image_gpu(V, F, D, width, height, occlusion_truncation, use_depth_prior);
+#else
+    else {
+        // Move tensors to CPU for rasterization on non-CUDA devices (e.g. MPS)
+        auto V_cpu = V.to(torch::kCPU);
+        auto F_cpu = F.to(torch::kCPU);
+        auto D_cpu = D.to(torch::kCPU);
+        return rasterize_image_cpu(V_cpu, F_cpu, D_cpu, width, height, occlusion_truncation, use_depth_prior);
+    }
+#endif
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

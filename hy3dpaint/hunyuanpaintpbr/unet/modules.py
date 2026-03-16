@@ -51,6 +51,36 @@ class Dino_v2(nn.Module):
         self.dino_processor = AutoImageProcessor.from_pretrained(dino_v2_path)
         self.dino_v2 = AutoModel.from_pretrained(dino_v2_path)
 
+        # Fix MPS bug: non-contiguous fp16→fp32 upcast produces wrong values.
+        # HF's interpolate_pos_encoding does permute() then .to(float32) on a
+        # non-contiguous view, which MPS handles incorrectly. Adding
+        # .contiguous() before the upcast fixes it (max_diff drops from 339
+        # to 0.048 over 40 layers).
+        _orig_interp = self.dino_v2.embeddings.interpolate_pos_encoding
+        _embeddings = self.dino_v2.embeddings
+
+        def _fixed_interp(embeddings_tensor, height, width):
+            num_patches = embeddings_tensor.shape[1] - 1
+            num_positions = _embeddings.position_embeddings.shape[1] - 1
+            if not torch.jit.is_tracing() and num_patches == num_positions and height == width:
+                return _embeddings.position_embeddings
+            class_pos = _embeddings.position_embeddings[:, :1]
+            patch_pos = _embeddings.position_embeddings[:, 1:]
+            dim = embeddings_tensor.shape[-1]
+            sqrt_n = int(num_positions ** 0.5)
+            patch_pos = patch_pos.reshape(1, sqrt_n, sqrt_n, dim)
+            patch_pos = patch_pos.permute(0, 3, 1, 2).contiguous()
+            target_dtype = patch_pos.dtype
+            patch_pos = torch.nn.functional.interpolate(
+                patch_pos.to(torch.float32),
+                size=(height // _embeddings.patch_size, width // _embeddings.patch_size),
+                mode="bicubic", align_corners=False,
+            ).to(dtype=target_dtype)
+            patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, -1, dim)
+            return torch.cat((class_pos, patch_pos), dim=1)
+
+        self.dino_v2.embeddings.interpolate_pos_encoding = _fixed_interp
+
         for param in self.parameters():
             param.requires_grad = False
 

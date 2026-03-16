@@ -18,36 +18,33 @@ import random
 import numpy as np
 from PIL import Image
 from typing import List
-import huggingface_hub
 from omegaconf import OmegaConf
 from diffusers import DiffusionPipeline
 from diffusers import EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler
+from model_paths import resolve_hunyuan_paths
 
 
 class multiviewDiffusionNet:
     def __init__(self, config) -> None:
         self.device = config.device
-
         cfg_path = config.multiview_cfg_path
-        custom_pipeline = os.path.join(os.path.dirname(__file__),"..","hunyuanpaintpbr")
+        custom_pipeline = getattr(config, "custom_pipeline", None)
+        if not custom_pipeline:
+            custom_pipeline = os.path.join(os.path.dirname(__file__), "..", "hunyuanpaintpbr")
         cfg = OmegaConf.load(cfg_path)
         self.cfg = cfg
         self.mode = self.cfg.model.params.stable_diffusion_config.custom_pipeline[2:]
 
-        model_path = huggingface_hub.snapshot_download(
-            repo_id=config.multiview_pretrained_path,
-            allow_patterns=["hunyuan3d-paintpbr-v2-1/*"],
-        )
+        model_path = self._resolve_model_path(config.multiview_pretrained_path)
 
-        model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
         pipeline = DiffusionPipeline.from_pretrained(
             model_path,
-            custom_pipeline=custom_pipeline, 
+            custom_pipeline=custom_pipeline,
             torch_dtype=torch.float16
         )
 
         pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config, timestep_spacing="trailing")
-        pipeline.set_progress_bar_config(disable=True)
+        pipeline.set_progress_bar_config(disable=False)
         pipeline.eval()
         setattr(pipeline, "view_size", cfg.model.params.get("view_size", 320))
         self.pipeline = pipeline.to(self.device)
@@ -57,6 +54,12 @@ class multiviewDiffusionNet:
             self.dino_v2 = Dino_v2(config.dino_ckpt_path).to(torch.float16)
             self.dino_v2 = self.dino_v2.to(self.device)
 
+    @staticmethod
+    def _resolve_model_path(model_ref: str) -> str:
+        if os.path.isdir(model_ref) and os.path.isfile(os.path.join(model_ref, "model_index.json")):
+            return model_ref
+        return resolve_hunyuan_paths(model_ref).texture_dir
+
     def seed_everything(self, seed):
         random.seed(seed)
         np.random.seed(seed)
@@ -64,14 +67,17 @@ class multiviewDiffusionNet:
         os.environ["PL_GLOBAL_SEED"] = str(seed)
 
     @torch.no_grad()
-    def __call__(self, images, conditions, prompt=None, custom_view_size=None, resize_input=False):
+    def __call__(self, images, conditions, prompt=None, custom_view_size=None, resize_input=False,
+                 seed: int = 0, num_inference_steps=None, guidance_scale=None):
         pils = self.forward_one(
-            images, conditions, prompt=prompt, custom_view_size=custom_view_size, resize_input=resize_input
+            images, conditions, prompt=prompt, custom_view_size=custom_view_size, resize_input=resize_input,
+            seed=seed, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale,
         )
         return pils
 
-    def forward_one(self, input_images, control_images, prompt=None, custom_view_size=None, resize_input=False):
-        self.seed_everything(0)
+    def forward_one(self, input_images, control_images, prompt=None, custom_view_size=None, resize_input=False,
+                    seed: int = 0, num_inference_steps=None, guidance_scale=None):
+        self.seed_everything(seed)
         custom_view_size = custom_view_size if custom_view_size is not None else self.pipeline.view_size
         if not isinstance(input_images, List):
             input_images = [input_images]
@@ -85,7 +91,7 @@ class multiviewDiffusionNet:
             control_images[i] = control_images[i].resize((custom_view_size, custom_view_size))
             if control_images[i].mode == "L":
                 control_images[i] = control_images[i].point(lambda x: 255 if x > 1 else 0, mode="1")
-        kwargs = dict(generator=torch.Generator(device=self.pipeline.device).manual_seed(0))
+        kwargs = dict(generator=torch.Generator(device=self.pipeline.device).manual_seed(seed))
 
         num_view = len(control_images) // 2
         normal_image = [[control_images[i] for i in range(num_view)]]
@@ -109,13 +115,15 @@ class multiviewDiffusionNet:
             "DDIMScheduler": 50,
             "ShiftSNRScheduler": 15,
         }
+        steps = num_inference_steps or infer_steps_dict[self.pipeline.scheduler.__class__.__name__]
+        cfg = guidance_scale or 3.0
 
         mvd_image = self.pipeline(
             input_images[0:1],
-            num_inference_steps=infer_steps_dict[self.pipeline.scheduler.__class__.__name__],
+            num_inference_steps=steps,
             prompt=prompt,
             sync_condition=sync_condition,
-            guidance_scale=3.0,
+            guidance_scale=cfg,
             **kwargs,
         ).images
 

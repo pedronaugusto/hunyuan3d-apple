@@ -29,6 +29,7 @@ from typing import Optional
 import torch
 import uvicorn
 from fastapi import FastAPI
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 
@@ -39,8 +40,6 @@ from constants import (
     SERVER_ERROR_MSG, DEFAULT_SAVE_DIR, API_TITLE, API_DESCRIPTION, 
     API_VERSION, API_CONTACT, API_LICENSE_INFO, API_TAGS_METADATA
 )
-from model_worker import ModelWorker
-
 # Global variables
 SAVE_DIR = DEFAULT_SAVE_DIR
 worker_id = str(uuid.uuid4())[:6]
@@ -88,7 +87,7 @@ async def generate_3d_model(request: GenerationRequest):
     
     uid = uuid.uuid4()
     try:
-        file_path, uid = worker.generate(uid, params)
+        file_path, uid = await run_in_threadpool(worker.generate, uid, params)
         return FileResponse(file_path)
     except ValueError as e:
         traceback.print_exc()
@@ -153,6 +152,14 @@ async def health_check():
     return JSONResponse({"status": "healthy", "worker_id": worker_id}, status_code=200)
 
 
+@app.get("/diagnostics", tags=["status"])
+async def diagnostics():
+    payload = {"status": "starting" if worker is None else "ready", "worker_id": worker_id}
+    if worker is not None and hasattr(worker, "get_diagnostics"):
+        payload.update(worker.get_diagnostics())
+    return JSONResponse(payload, status_code=200)
+
+
 @app.get("/status/{uid}", response_model=StatusResponse, tags=["status"])
 async def status(uid: str):
     """
@@ -167,8 +174,6 @@ async def status(uid: str):
     # Check for textured file first (preferred output)
     textured_file_path = os.path.join(SAVE_DIR, f'{uid}_textured.glb')
     initial_file_path = os.path.join(SAVE_DIR, f'{uid}_initial.glb')
-    
-    #print(f"Checking files: {textured_file_path} ({os.path.exists(textured_file_path)}), {initial_file_path} ({os.path.exists(initial_file_path)})")
     
     # If textured file exists, generation is complete
     if os.path.exists(textured_file_path):
@@ -205,26 +210,47 @@ if __name__ == "__main__":
     parser.add_argument('--compile', action='store_true')
     parser.add_argument('--low_vram_mode', action='store_true')
     parser.add_argument('--cache-path', type=str, default='./gradio_cache')
+    parser.add_argument('--backend', type=str, default=None,
+                        choices=['mlx', 'pytorch'],
+                        help='Inference backend (default: mlx on Apple Silicon, pytorch on CUDA)')
     args = parser.parse_args()
     logger.info(f"args: {args}")
 
     # Update SAVE_DIR based on cache-path argument
     SAVE_DIR = args.cache_path
     os.makedirs(SAVE_DIR, exist_ok=True)
-    
+
+    # Resolve backend
+    backend = args.backend
+    if backend is None:
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            backend = 'mlx'
+        else:
+            backend = 'pytorch'
+    logger.info(f"Using backend: {backend}")
 
     model_semaphore = asyncio.Semaphore(args.limit_model_concurrency)
 
-    worker = ModelWorker(
-        model_path=args.model_path, 
-        subfolder=args.subfolder,
-        device=args.device, 
-        low_vram_mode=args.low_vram_mode,
-        worker_id=worker_id,
-        model_semaphore=model_semaphore,
-        save_dir=SAVE_DIR,
-        mc_algo=args.mc_algo,
-        enable_flashvdm=args.enable_flashvdm,
-        compile=args.compile
-    )
+    if backend == 'mlx':
+        from mlx_model_worker import MlxModelWorker
+        worker = MlxModelWorker(
+            model_path=args.model_path,
+            worker_id=worker_id,
+            model_semaphore=model_semaphore,
+            save_dir=SAVE_DIR,
+        )
+    else:
+        from model_worker import ModelWorker
+        worker = ModelWorker(
+            model_path=args.model_path,
+            subfolder=args.subfolder,
+            device=args.device,
+            low_vram_mode=args.low_vram_mode,
+            worker_id=worker_id,
+            model_semaphore=model_semaphore,
+            save_dir=SAVE_DIR,
+            mc_algo=args.mc_algo,
+            enable_flashvdm=args.enable_flashvdm,
+            compile=args.compile
+        )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

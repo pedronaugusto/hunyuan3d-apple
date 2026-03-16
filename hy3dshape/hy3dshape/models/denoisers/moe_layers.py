@@ -155,23 +155,28 @@ class MoEBlock(nn.Module):
 
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
-        expert_cache = torch.zeros_like(x) 
-        idxs = flat_expert_indices.argsort()
-        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
-        token_idxs = idxs // self.moe_top_k 
-        for i, end_idx in enumerate(tokens_per_expert):
-            start_idx = 0 if i == 0 else tokens_per_expert[i-1]
-            if start_idx == end_idx:
-                continue
-            expert = self.experts[i]
-            exp_token_idx = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
-            expert_out = expert(expert_tokens)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]]) 
-            
-            # for fp16 and other dtype
-            expert_cache = expert_cache.to(expert_out.dtype)
-            expert_cache.scatter_reduce_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]),
-                                         expert_out, 
-                                         reduce='sum')
-        return expert_cache
+        # Export-friendly: run all experts on all tokens, mask by one-hot
+        # flat_expert_indices: [N*top_k], flat_expert_weights: [N*top_k, 1]
+        N = x.shape[0]
+        D = x.shape[-1]
+        top_k = self.moe_top_k
+        num_experts = len(self.experts)
+
+        # All expert outputs: [E, N, D]
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=0)
+
+        # One-hot mask: [N*top_k, E]
+        one_hot = torch.zeros(N * top_k, num_experts, device=x.device, dtype=x.dtype)
+        one_hot.scatter_(1, flat_expert_indices.unsqueeze(1).long(), 1.0)
+
+        # Weighted one-hot: [N*top_k, E] * [N*top_k, 1] -> [N*top_k, E]
+        weighted = one_hot * flat_expert_weights
+
+        # Reshape for per-token aggregation: [N, top_k, E] -> sum over top_k -> [N, E]
+        per_token_weights = weighted.view(N, top_k, num_experts).sum(dim=1)  # [N, E]
+
+        # Weighted sum of expert outputs: [E, N, D] -> einsum -> [N, D]
+        result = torch.einsum('en, end -> nd', per_token_weights.T.to(expert_outputs.dtype), expert_outputs.permute(0, 1, 2))
+        # Simpler: expert_outputs is [E, N, D], weights is [N, E]
+        result = torch.einsum('ne, end -> nd', per_token_weights.to(expert_outputs.dtype), expert_outputs)
+        return result
